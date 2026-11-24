@@ -102,25 +102,33 @@ jobs:
 
       - name: Assemble platform packages
         run: |
-          npx napi create-npm-dir
-          npx napi artifacts --dir artifacts
+          npx napi create-npm-dir -t ./npm
+          npx napi artifacts -d ./artifacts --npm-dir ./npm
           cp artifacts/bindings-x86_64-unknown-linux-gnu/index.js ./index.js
 
       - name: Publish platform binaries and root package to GitHub Packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            const rootPkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            rootPkg.optionalDependencies = rootPkg.optionalDependencies || {};
+            for (const dir of fs.readdirSync("npm")) {
+              const pkgPath = path.join("npm", dir, "package.json");
+              if (!fs.existsSync(pkgPath)) continue;
+              const subPkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+              subPkg.publishConfig = { registry: "https://npm.pkg.github.com" };
+              subPkg.repository = rootPkg.repository;
+              fs.writeFileSync(pkgPath, JSON.stringify(subPkg, null, 2));
+              rootPkg.optionalDependencies[subPkg.name] = rootPkg.version;
+            }
+            fs.writeFileSync("package.json", JSON.stringify(rootPkg, null, 2));
+          '
           for pkg in npm/*; do
             if [ -f "$pkg/package.json" ]; then
-              node -e '
-                const fs = require("fs");
-                const p = process.argv[1];
-                const j = JSON.parse(fs.readFileSync(p, "utf8"));
-                j.publishConfig = { registry: "https://npm.pkg.github.com" };
-                j.repository = { type: "git", url: "https://github.com/grimmdev/redb-native.git" };
-                fs.writeFileSync(p, JSON.stringify(j, null, 2));
-              ' "$pkg/package.json"
-              npm publish "$pkg" --access public || true
+              npm publish "$pkg" || true
             fi
           done
           npm publish --ignore-scripts
