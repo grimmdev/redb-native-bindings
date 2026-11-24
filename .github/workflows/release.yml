@@ -106,24 +106,63 @@ jobs:
           npx napi artifacts -d ./artifacts --dist ./npm
           cp artifacts/bindings-x86_64-unknown-linux-gnu/index.js ./index.js
 
-      - name: Publish platform binaries and root package to GitHub Packages
+      - name: Assemble and publish packages to GitHub Packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           node -e '
             const fs = require("fs");
             const path = require("path");
+
             const rootPkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
             rootPkg.optionalDependencies = rootPkg.optionalDependencies || {};
-            for (const dir of fs.readdirSync("npm")) {
-              const pkgPath = path.join("npm", dir, "package.json");
-              if (!fs.existsSync(pkgPath)) continue;
-              const subPkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
-              subPkg.publishConfig = { registry: "https://npm.pkg.github.com" };
-              subPkg.repository = rootPkg.repository;
-              fs.writeFileSync(pkgPath, JSON.stringify(subPkg, null, 2));
-              rootPkg.optionalDependencies[subPkg.name] = rootPkg.version;
+
+            function walk(dir) {
+              let files = [];
+              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                const full = path.join(dir, entry.name);
+                if (entry.isDirectory()) files = files.concat(walk(full));
+                else files.push(full);
+              }
+              return files;
             }
+
+            const allFiles = walk("artifacts");
+            const indexJs = allFiles.find((f) => path.basename(f) === "index.js");
+            if (!indexJs) throw new Error("index.js not found in artifacts");
+            fs.copyFileSync(indexJs, "index.js");
+
+            const nodeFiles = allFiles.filter((f) => f.endsWith(".node"));
+            if (nodeFiles.length === 0) throw new Error("No .node binaries found in artifacts");
+
+            for (const file of nodeFiles) {
+              const base = path.basename(file);
+              const match = base.match(/^.+\.([^.]+)\.node$/);
+              if (!match) continue;
+              const triplet = match[1];
+              const [osName, cpuName, abi] = triplet.split("-");
+
+              const pkgDir = path.join("npm", triplet);
+              fs.mkdirSync(pkgDir, { recursive: true });
+              fs.copyFileSync(file, path.join(pkgDir, base));
+
+              const subPkg = {
+                name: `${rootPkg.name}-${triplet}`,
+                version: rootPkg.version,
+                os: [osName],
+                cpu: [cpuName],
+                ...(abi === "gnu" ? { libc: ["glibc"] } : abi === "musl" ? { libc: ["musl"] } : {}),
+                main: base,
+                files: [base],
+                license: rootPkg.license || "MIT",
+                repository: rootPkg.repository,
+                publishConfig: { registry: "https://npm.pkg.github.com" },
+              };
+
+              fs.writeFileSync(path.join(pkgDir, "package.json"), JSON.stringify(subPkg, null, 2));
+              rootPkg.optionalDependencies[subPkg.name] = subPkg.version;
+            }
+
             fs.writeFileSync("package.json", JSON.stringify(rootPkg, null, 2));
           '
           for pkg in npm/*; do
