@@ -100,12 +100,6 @@ jobs:
       - name: Install Node dependencies
         run: npm install
 
-      - name: Assemble platform packages
-        run: |
-          npx napi create-npm-dir -t ./npm
-          npx napi artifacts -d ./artifacts --dist ./npm
-          cp artifacts/bindings-x86_64-unknown-linux-gnu/index.js ./index.js
-
       - name: Assemble and publish packages to GitHub Packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
