@@ -1,8 +1,8 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use redb::{
-    Database, Durability, ReadOnlyDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
-    TableError,
+    Database, Durability, ReadableTable, ReadableTableMetadata, TableDefinition, TableError,
+    TableHandle,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -65,7 +65,7 @@ pub struct KvEntry {
 }
 
 #[napi(object)]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct KvBufferEntry {
     pub key: String,
     pub value: Buffer,
@@ -153,7 +153,8 @@ fn do_count(db: &Arc<RwLock<Database>>, table_name: &str) -> Result<i64> {
         Err(TableError::TableDoesNotExist(_)) => return Ok(0),
         Err(e) => return Err(map_err(e)),
     };
-    Ok(table.len().map_err(map_err)? as i64)
+    let len = table.len().map_err(map_err)? as i64;
+    Ok(len)
 }
 
 fn do_get_bytes(db: &Arc<RwLock<Database>>, table_name: &str, key: &str) -> Result<Option<Vec<u8>>> {
@@ -165,7 +166,8 @@ fn do_get_bytes(db: &Arc<RwLock<Database>>, table_name: &str, key: &str) -> Resu
         Err(TableError::TableDoesNotExist(_)) => return Ok(None),
         Err(e) => return Err(map_err(e)),
     };
-    Ok(table.get(key).map_err(map_err)?.map(|v| v.value().to_vec()))
+    let val = table.get(key).map_err(map_err)?.map(|v| v.value().to_vec());
+    Ok(val)
 }
 
 fn do_get_many_strings(
@@ -203,7 +205,8 @@ fn do_has(db: &Arc<RwLock<Database>>, table_name: &str, key: &str) -> Result<boo
         Err(TableError::TableDoesNotExist(_)) => return Ok(false),
         Err(e) => return Err(map_err(e)),
     };
-    Ok(table.get(key).map_err(map_err)?.is_some())
+    let exists = table.get(key).map_err(map_err)?.is_some();
+    Ok(exists)
 }
 
 fn do_set_bytes(
@@ -237,7 +240,8 @@ fn do_delete(
     let removed = {
         let def: TableDefinition<&str, &[u8]> = TableDefinition::new(table_name);
         let mut table = write_txn.open_table(def).map_err(map_err)?;
-        table.remove(key).map_err(map_err)?.is_some()
+        let was_present = table.remove(key).map_err(map_err)?.is_some();
+        was_present
     };
     write_txn.commit().map_err(map_err)?;
     Ok(removed)
@@ -315,7 +319,8 @@ fn do_transaction(
 
         match step.op.as_str() {
             "assertMissing" => {
-                if table.get(key).map_err(map_err)?.is_some() {
+                let exists = table.get(key).map_err(map_err)?.is_some();
+                if exists {
                     return Err(Error::from_reason(format!(
                         "CAS failed: key '{}' already exists in table '{}'",
                         key, step.table
@@ -323,7 +328,8 @@ fn do_transaction(
                 }
             }
             "assertExists" => {
-                if table.get(key).map_err(map_err)?.is_none() {
+                let exists = table.get(key).map_err(map_err)?.is_some();
+                if !exists {
                     return Err(Error::from_reason(format!(
                         "CAS failed: key '{}' missing in table '{}'",
                         key, step.table
@@ -361,7 +367,7 @@ fn do_transaction(
                 table.insert(key, buf.as_ref()).map_err(map_err)?;
             }
             "delete" => {
-                table.remove(key).map_err(map_err)?;
+                let _ = table.remove(key).map_err(map_err)?;
             }
             other => {
                 return Err(Error::from_reason(format!(
@@ -925,10 +931,10 @@ impl RedbDatabase {
     }
 }
 
-/// Dedicated read-only handle using redb::ReadOnlyDatabase for safe concurrent inspection.
+/// Read-only API handle over an existing redb file (opens without creating and exposes read ops only).
 #[napi]
 pub struct ReadOnlyRedbDatabase {
-    db: Arc<ReadOnlyDatabase>,
+    db: Arc<RwLock<Database>>,
 }
 
 #[napi]
@@ -941,29 +947,22 @@ impl ReadOnlyRedbDatabase {
             .map(|v| v as usize)
             .unwrap_or(DEFAULT_CACHE_BYTES);
 
-        let db = ReadOnlyDatabase::builder()
+        let db = Database::builder()
             .set_cache_size(cache_bytes)
             .open(&db_path)
             .map_err(map_err)?;
 
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(RwLock::new(db)),
+        })
     }
 
     #[napi]
     pub async fn get(&self, table_name: String, key: String) -> Result<Option<String>> {
         let db = Arc::clone(&self.db);
-        napi::tokio::task::spawn_blocking(move || {
-            let read_txn = db.begin_read().map_err(map_err)?;
-            let def: TableDefinition<&str, &[u8]> = TableDefinition::new(&table_name);
-            let table = match read_txn.open_table(def) {
-                Ok(t) => t,
-                Err(TableError::TableDoesNotExist(_)) => return Ok(None),
-                Err(e) => return Err(map_err(e)),
-            };
-            match table.get(key.as_str()).map_err(map_err)? {
-                Some(v) => Ok(Some(String::from_utf8(v.value().to_vec()).map_err(map_err)?)),
-                None => Ok(None),
-            }
+        napi::tokio::task::spawn_blocking(move || match do_get_bytes(&db, &table_name, &key)? {
+            Some(bytes) => Ok(Some(String::from_utf8(bytes).map_err(map_err)?)),
+            None => Ok(None),
         })
         .await
         .map_err(map_err)?
@@ -971,27 +970,15 @@ impl ReadOnlyRedbDatabase {
 
     #[napi]
     pub fn get_sync(&self, table_name: String, key: String) -> Result<Option<String>> {
-        let read_txn = self.db.begin_read().map_err(map_err)?;
-        let def: TableDefinition<&str, &[u8]> = TableDefinition::new(&table_name);
-        let table = match read_txn.open_table(def) {
-            Ok(t) => t,
-            Err(TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(e) => return Err(map_err(e)),
-        };
-        match table.get(key.as_str()).map_err(map_err)? {
-            Some(v) => Ok(Some(String::from_utf8(v.value().to_vec()).map_err(map_err)?)),
+        match do_get_bytes(&self.db, &table_name, &key)? {
+            Some(bytes) => Ok(Some(String::from_utf8(bytes).map_err(map_err)?)),
             None => Ok(None),
         }
     }
 
     #[napi]
     pub fn list_tables_sync(&self) -> Result<Vec<String>> {
-        let read_txn = self.db.begin_read().map_err(map_err)?;
-        let mut names = Vec::new();
-        for handle in read_txn.list_tables().map_err(map_err)? {
-            names.push(handle.name().to_string());
-        }
-        Ok(names)
+        do_list_tables(&self.db)
     }
 }
 
@@ -1014,7 +1001,6 @@ mod tests {
             )
             .unwrap();
 
-            // Sync and async writes + multi-key reads.
             db.set_sync("users".into(), "u:1".into(), "Ada".into(), None)
                 .unwrap();
             db.set("users".into(), "u:2".into(), "Linus".into(), None)
@@ -1027,7 +1013,6 @@ mod tests {
                 .unwrap();
             assert_eq!(batch, vec![Some("Ada".into()), Some("Linus".into()), None]);
 
-            // Concurrent multi-threaded reads via cloned handles.
             let h1 = db.clone_handle();
             let h2 = db.clone_handle();
             let (r1, r2) = napi::tokio::join!(
@@ -1037,7 +1022,6 @@ mod tests {
             assert_eq!(r1.unwrap().as_deref(), Some("Ada"));
             assert_eq!(r2.unwrap().as_deref(), Some("Linus"));
 
-            // Atomic cross-table CAS transaction with rollback check.
             db.transaction_sync(
                 vec![
                     BatchOp {
