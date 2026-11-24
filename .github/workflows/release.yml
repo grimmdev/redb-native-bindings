@@ -79,7 +79,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Publish @grimmdev/redb-native
+    name: Publish @grimmdev/redb-native-bindings
     needs: build
     runs-on: ubuntu-latest
     steps:
