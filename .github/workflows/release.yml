@@ -1,0 +1,126 @@
+name: Release to GitHub Packages
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.settings.target }})
+    runs-on: ${{ matrix.settings.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            build: npm run build -- --target x86_64-unknown-linux-gnu
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            setup: sudo apt-get update && sudo apt-get install -y musl-tools
+            build: npm run build -- --target x86_64-unknown-linux-musl
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            setup: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+            env_cc: aarch64-linux-gnu-gcc
+            build: npm run build -- --target aarch64-unknown-linux-gnu
+          - host: macos-14
+            target: aarch64-apple-darwin
+            build: npm run build -- --target aarch64-apple-darwin
+          - host: macos-13
+            target: x86_64-apple-darwin
+            build: npm run build -- --target x86_64-apple-darwin
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            build: npm run build -- --target x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.settings.target }}
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cross-compile dependencies
+        if: matrix.settings.setup
+        run: ${{ matrix.settings.setup }}
+
+      - name: Install Node dependencies
+        run: npm install
+
+      - name: Build native binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.settings.env_cc }}
+        run: ${{ matrix.settings.build }}
+
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.settings.target }}
+          path: |
+            *.node
+            index.js
+            index.d.ts
+          if-no-files-found: error
+
+  publish:
+    name: Publish @grimmdev/redb-native
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js for GitHub Packages
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@grimmdev"
+
+      - name: Download all native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Install Node dependencies
+        run: npm install
+
+      - name: Assemble platform packages
+        run: |
+          npx napi create-npm-dir
+          npx napi artifacts --dir artifacts
+          cp artifacts/bindings-x86_64-unknown-linux-gnu/index.js ./index.js
+
+      - name: Publish platform binaries and root package to GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for pkg in npm/*; do
+            if [ -f "$pkg/package.json" ]; then
+              node -e '
+                const fs = require("fs");
+                const p = process.argv[1];
+                const j = JSON.parse(fs.readFileSync(p, "utf8"));
+                j.publishConfig = { registry: "https://npm.pkg.github.com" };
+                j.repository = { type: "git", url: "https://github.com/grimmdev/redb-native.git" };
+                fs.writeFileSync(p, JSON.stringify(j, null, 2));
+              ' "$pkg/package.json"
+              npm publish "$pkg" --access public || true
+            fi
+          done
+          npm publish --ignore-scripts
